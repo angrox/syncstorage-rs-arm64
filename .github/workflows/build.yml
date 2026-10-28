@@ -1,0 +1,166 @@
+name: build
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream release tag to build (empty = latest release)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: mozilla-services/syncstorage-rs
+  IMAGE: ghcr.io/${{ github.repository_owner }}/syncserver-postgres-arm64
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      build: ${{ steps.exists.outputs.build }}
+    steps:
+      - name: Resolve upstream tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            # releases/latest skips drafts and prereleases
+            tag=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          fi
+          # Validate before it lands in a git ref and an image tag
+          if ! printf '%s' "$tag" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::unexpected tag '$tag'"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Upstream tag: $tag"
+
+      - name: Skip if already published
+        id: exists
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          # A manual run always rebuilds; the cron only builds new releases
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif docker manifest inspect "$IMAGE:$TAG" > /dev/null 2>&1; then
+            echo "$IMAGE:$TAG already exists, nothing to do"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: sync
+          POSTGRES_PASSWORD: sync
+          POSTGRES_DB: syncstorage
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sync"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Check out upstream at ${{ env.TAG }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ env.TAG }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=syncserver-postgres-arm64
+            org.opencontainers.image.description=Unofficial arm64 build of mozilla-services/syncstorage-rs ${{ env.TAG }} (Postgres backend)
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.TAG }}
+            org.opencontainers.image.licenses=MPL-2.0
+
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            SYNCSTORAGE_DATABASE_BACKEND=postgres
+            TOKENSERVER_DATABASE_BACKEND=postgres
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          docker run -d --name syncserver --network host \
+            -e SYNC_HOST=127.0.0.1 \
+            -e SYNC_PORT=8000 \
+            -e SYNC_MASTER_SECRET=smoke-test-only-not-a-real-secret \
+            -e SYNC_SYNCSTORAGE__DATABASE_URL=postgres://sync:sync@127.0.0.1/syncstorage \
+            -e SYNC_TOKENSERVER__DATABASE_URL=postgres://sync:sync@127.0.0.1/syncstorage \
+            -e SYNC_TOKENSERVER__ENABLED=true \
+            -e SYNC_TOKENSERVER__RUN_MIGRATIONS=true \
+            -e SYNC_TOKENSERVER__FXA_EMAIL_DOMAIN=api.accounts.firefox.com \
+            -e SYNC_TOKENSERVER__FXA_OAUTH_SERVER_URL=https://oauth.accounts.firefox.com \
+            -e SYNC_TOKENSERVER__INIT_NODE_URL=http://127.0.0.1:8000 \
+            "$IMAGE:$TAG"
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/__heartbeat__; then
+              echo
+              echo "heartbeat OK"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::heartbeat never answered"
+          docker logs syncserver
+          exit 1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push the exact image the smoke test ran, not a rebuild
+      - name: Push
+        run: docker push --all-tags "$IMAGE"
