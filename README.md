@@ -16,6 +16,12 @@ ghcr.io/angrox/syncserver-postgres-arm64:latest
 
 Pin the release tag in production; `latest` is just the newest build.
 
+> **Disclaimer:** This repo (workflow and docs) was written with
+> [Claude Code](https://claude.com/claude-code). The image build was tested
+> locally on a Raspberry Pi (arm64) before the repo was published and the
+> build moved to GitHub Actions. It is not affiliated with or supported by
+> Mozilla. Use at your own risk.
+
 ## How it builds
 
 `.github/workflows/build.yml`:
