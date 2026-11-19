@@ -14,6 +14,9 @@ ghcr.io/angrox/syncserver-postgres-arm64:<upstream-tag>   # e.g. 0.24.0
 ghcr.io/angrox/syncserver-postgres-arm64:latest
 ```
 
+Each build also gets a [GitHub release](https://github.com/angrox/syncstorage-rs-arm64/releases)
+with the image digest.
+
 Pin the release tag in production; `latest` is just the newest build.
 
 > **Disclaimer:** This repo (workflow and docs) was written with
@@ -34,7 +37,11 @@ Pin the release tag in production; `latest` is just the newest build.
    Postgres image).
 3. **smoke test** — runs the image against a throwaway Postgres 18 and
    requires `/__heartbeat__` to answer. A failing build is never pushed.
-4. **push** — to GHCR with the workflow's own `GITHUB_TOKEN`.
+4. **push** — to GHCR with the workflow's own `GITHUB_TOKEN`. `latest` moves
+   only when the tag is upstream's newest release.
+5. **release** — creates a GitHub release named after the upstream tag, whose
+   notes link the GHCR package and give the pull command and image digest. A
+   manual rebuild refreshes the notes of an existing release with the new digest.
 
 Rebuild a release by hand: *Actions → build → Run workflow*, optionally with a
 tag. A manual run always rebuilds and overwrites that tag.

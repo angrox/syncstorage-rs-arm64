@@ -26,6 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      latest: ${{ steps.tag.outputs.latest }}
       build: ${{ steps.exists.outputs.build }}
     steps:
       - name: Resolve upstream tag
@@ -34,18 +35,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ -n "$INPUT_TAG" ]; then
-            tag="$INPUT_TAG"
-          else
-            # releases/latest skips drafts and prereleases
-            tag=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
-          fi
+          # releases/latest skips drafts and prereleases
+          upstream_latest=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          tag="${INPUT_TAG:-$upstream_latest}"
           # Validate before it lands in a git ref and an image tag
           if ! printf '%s' "$tag" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "::error::unexpected tag '$tag'"
             exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Only upstream's newest release gets :latest and the "Latest"
+          # release badge, so a manual rebuild of an old tag can't move them back
+          if [ "$tag" = "$upstream_latest" ]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
           echo "Upstream tag: $tag"
 
       - name: Skip if already published
@@ -71,6 +76,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     env:
       TAG: ${{ needs.resolve.outputs.tag }}
     services:
@@ -105,7 +112,7 @@ jobs:
           images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=${{ env.TAG }}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ needs.resolve.outputs.latest == 'true' }}
           labels: |
             org.opencontainers.image.title=syncserver-postgres-arm64
             org.opencontainers.image.description=Unofficial arm64 build of mozilla-services/syncstorage-rs ${{ env.TAG }} (Postgres backend)
@@ -163,4 +170,60 @@ jobs:
 
       # Push the exact image the smoke test ran, not a rebuild
       - name: Push
-        run: docker push --all-tags "$IMAGE"
+        id: push
+        run: |
+          docker push --all-tags "$IMAGE"
+          ref=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$TAG")
+          digest="${ref#*@}"
+          if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::could not read pushed digest from '$ref'"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pushed $IMAGE@$digest"
+
+  release:
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      LATEST: ${{ needs.resolve.outputs.latest }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PACKAGE_URL: ${{ github.server_url }}/${{ github.repository }}/pkgs/container/syncserver-postgres-arm64
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Create or update release ${{ env.TAG }}
+        run: |
+          notes=$(mktemp)
+          cat > "$notes" <<EOF
+          Unofficial **linux/arm64** build of [mozilla-services/syncstorage-rs $TAG](https://github.com/$UPSTREAM/releases/tag/$TAG), Postgres backend.
+
+          **Container image:** [$IMAGE]($PACKAGE_URL)
+
+          \`\`\`
+          docker pull $IMAGE:$TAG
+          \`\`\`
+
+          Pinned by digest:
+
+          \`\`\`
+          $IMAGE@$DIGEST
+          \`\`\`
+
+          Built from upstream's unmodified \`Dockerfile\` at tag \`$TAG\` and smoke-tested against Postgres 18 before push ([build run]($RUN_URL)).
+          See the [upstream release notes](https://github.com/$UPSTREAM/releases/tag/$TAG) for what changed.
+          EOF
+          # A manual rebuild pushes a new digest: refresh the notes of an existing release
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file "$notes" --latest="$LATEST"
+          else
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "syncstorage-rs $TAG (arm64, Postgres)" \
+              --notes-file "$notes" \
+              --latest="$LATEST"
+          fi
